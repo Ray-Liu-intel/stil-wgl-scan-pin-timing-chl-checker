@@ -1,4 +1,4 @@
-"""STIL basic pin checker with opt-in IOD/CCD Channellink copies (Python 3.10+, stdlib only)."""
+"""STIL/WGL scan pin, timing and Channellink checker (Python 3.10+, stdlib only)."""
 import argparse
 from collections import Counter
 import gzip
@@ -9,6 +9,8 @@ from pathlib import Path
 import re
 import shutil
 import sys
+from wgl_checks import check_wgl, timing_wgl
+from stil_checks import timing_stil
 
 DEFAULT_GROUPS = ('stm_scan_in', 'stm_scan_out', 'stm_scan_nonclk_dpin')
 # Quoted strings are consumed whole so comment markers inside names remain literal.
@@ -217,9 +219,12 @@ def check_file(path, groups):
 
 
 def pattern_parts(path):
-    """Keep the original extension spelling, including the complete .stil.gz suffix."""
+    """Keep the original complete .stil/.wgl and optional .gz suffix."""
     name = Path(path).name
-    length = 8 if name.lower().endswith('.stil.gz') else 5
+    length = next((len(ext) for ext in ('.stil.gz', '.wgl.gz', '.stil', '.wgl')
+                   if name.lower().endswith(ext)), 0)
+    if not length:
+        raise ParseError('Unsupported pattern extension: ' + name)
     return name[:-length], name[-length:]
 
 
@@ -241,7 +246,7 @@ def find_inputs(path):
         for folder, dirs, files in os.walk(path, followlinks=False):
             dirs[:] = [d for d in dirs if not d.lower().endswith('_channellink')]
             candidates.extend(Path(folder) / f for f in files)
-    return sorted(p for p in candidates if p.name.lower().endswith(('.stil', '.stil.gz'))
+    return sorted(p for p in candidates if p.name.lower().endswith(('.stil', '.stil.gz', '.wgl', '.wgl.gz'))
                   and not generated_path(p))
 
 
@@ -256,10 +261,10 @@ def channel_link_plan(result, io_groups, *, die):
     plan = {'eligible': False, 'action': 'SKIPPED', 'destination': None}
     if generated_path(path):
         reason = 'Already a Channellink output'
-    elif not re.search(r'(?:^|_)body(?:_|$)', stem, re.I):
-        reason = 'Not a body filename'
+    elif not re.search(r'(?:^|_)(?:body|chain)(?:_|$)', stem, re.I):
+        reason = 'Not a body or chain filename'
     elif re.search(r'(?:^|_)setup(?:_|$)', stem, re.I):
-        reason = 'Ambiguous body/setup filename'
+        reason = 'Ambiguous body/chain with setup filename'
     elif result['status'] != 'PASS' or not result['pins']:
         reason = 'Pin membership check did not PASS'
     elif not all(io_groups[0 if row['role'] == 'ScanIn' else 1] in row['groups']
@@ -338,7 +343,7 @@ def resolve_pin(args):
 
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('input', type=Path, help='STIL file or directory (recursive)')
+    parser.add_argument('input', type=Path, help='STIL/WGL file or directory (recursive)')
     parser.add_argument('--pin-file', type=Path)
     parser.add_argument('--plt-dir', type=Path)
     parser.add_argument('--stage', choices=('sort', 'class'))
@@ -348,6 +353,8 @@ def main(argv=None):
     parser.add_argument('--channel-link', action='store_true',
                         help='Opt in to IOD/CCD copies with _sc_v<number> names in source-parent/v<number>_Channellink')
     parser.add_argument('--dry-run', action='store_true', help='Preview --channel-link without copying')
+    parser.add_argument('--timing', action='store_true',
+                        help='Report conservative timing evidence; UNDETERMINED is not a timing pass')
     args = parser.parse_args(argv)
     if args.dry_run and not args.channel_link:
         parser.error('--dry-run requires --channel-link')
@@ -358,15 +365,33 @@ def main(argv=None):
         groups = load_groups(pin_file, args.groups)
         paths = find_inputs(args.input)
         if not paths:
-            raise ParseError('No .stil or .stil.gz files found')
-        results = [check_file(path, groups) for path in paths]
+            raise ParseError('No .stil/.wgl files found')
+        if args.channel_link and not args.timing and any('.wgl' in path.name.lower() for path in paths):
+            raise ParseError('WGL Channellink export requires --timing; unvalidated WGL cannot be copied')
+        results = [(check_wgl(path, groups, normalize) if '.wgl' in path.name.lower() else check_file(path, groups))
+                   for path in paths]
         for result in results:
-            result['channel_link'] = (export_channel_link(result, args.groups[:2], args.dry_run, die=args.die)
-                                      if args.channel_link else channel_link_plan(result, args.groups[:2], die=args.die))
+            if args.timing:
+                if '_wgl_timing' in result and args.die != 'CCD':
+                    result['timing'] = {'status': 'UNDETERMINED',
+                                        'reason': 'WGL symbolic checks are defined only for CCD; die mismatch'}
+                else:
+                    result['timing'] = (timing_wgl(result, args.die) if '_wgl_timing' in result
+                                        else timing_stil(result['file'], args.die))
+            # Never export a file which timing explicitly failed or was not established.
+            if args.channel_link and args.timing and result['timing']['status'] != 'PASS':
+                result['channel_link'] = {'eligible': False, 'action': 'SKIPPED', 'destination': None,
+                                          'reason': 'Timing is not proven PASS'}
+            else:
+                result['channel_link'] = (export_channel_link(result, args.groups[:2], args.dry_run, die=args.die)
+                                          if args.channel_link else channel_link_plan(result, args.groups[:2], die=args.die))
+            result.pop('_wgl_timing', None)
         counts = dict(Counter(row['status'] for row in results))
         print(json.dumps({'pin_file': str(pin_file), 'group_sizes': {g: len(p) for g, p in groups.items()},
                           'die': args.die, 'channel_link_checks': args.die in ('IOD', 'CCD'),
-                          'normalization': 'uppercase; [n] -> _n', 'clock_checks': False,
+                          'normalization': 'uppercase; [n] -> _n', 'clock_checks': args.timing,
+                          'timing_summary': (dict(Counter(r['timing']['status'] for r in results))
+                                             if args.timing else None),
                           'direction_required': True, 'dpin_direction_exempt': True,
                           'channel_link_requested': args.channel_link, 'dry_run': args.dry_run,
                           'channel_link_summary': dict(Counter(r['channel_link']['action'] for r in results)),
@@ -375,7 +400,10 @@ def main(argv=None):
             return 2
         if any(r['status'] in ('ERROR', 'UNDETERMINED') for r in results):
             return 2
-        return 1 if counts.get('FAIL') else 0
+        if args.timing and any(r['timing']['status'] in ('ERROR', 'UNDETERMINED') for r in results):
+            return 2
+        return 1 if counts.get('FAIL') or (args.timing and any(r['timing']['status'] == 'FAIL'
+                                                          for r in results)) else 0
     except (OSError, ValueError) as exc:
         print(json.dumps({'status': 'ERROR', 'error': str(exc)}))
         return 2

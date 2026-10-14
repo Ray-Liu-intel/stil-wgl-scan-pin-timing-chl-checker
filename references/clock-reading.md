@@ -1,6 +1,6 @@
-# Understanding scan clocks in STIL (reference only)
+# Understanding and checking scan clocks in STIL
 
-This reference preserves the taught interpretation using **synthetic pin/chain names**. It is not a period specification and is not executed by the pin checker.
+This reference preserves the taught interpretation using **synthetic pin/chain names**. The optional `--timing` STIL checker now implements this evidence path for its supported execution subset. The numerical example itself is not a period specification.
 
 ## Evidence chain
 
@@ -66,5 +66,7 @@ Thus consecutive shift vectors using character 1 produce one pulse per 10 ns vec
 
 - Explain actual clock identity and transitions from the inspected file; do not infer from unrelated TX/RX names.
 - Do not label the numerical example as required timing.
-- TCK/period conformance is intentionally outside the automated checker.
+- With `--timing`, setup checks executed TCK cadence (CCD 10 MHz, IOD/DRD 25 MHz); body checks consecutive completed 100 MHz pulses on each ScanMasterClock; chain requires both. Pin membership remains a separate check.
+- Full-file parsing and supported execution are required for timing PASS. Unknown clock drive, unsupported syntax or unresolved context cannot PASS. Idle holds and trailing static levels are distinguished from repeated wrong-frequency trains; measured widths and intervals are reported.
+- For NRZ TCK, consecutive non-target intervals fail even with varying lengths. Scan clocks may have explicit inactive vectors between shift/capture operations; frequency checks apply to adjacent pulsing vectors, not the spacing across gated-off operations.
 - This knowledge can be used to answer clock questions even though pin checking has no clock PASS/FAIL result.

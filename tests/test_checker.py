@@ -4,10 +4,12 @@ import importlib.util
 from io import StringIO
 import json
 from pathlib import Path
+import sys
 import tempfile
 import unittest
 from unittest.mock import patch
 
+sys.path.insert(0, str(Path(__file__).parents[1] / 'scripts'))
 spec = importlib.util.spec_from_file_location('checker', Path(__file__).parents[1] / 'scripts/check_scan_pins.py')
 checker = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(checker)
@@ -34,6 +36,57 @@ ScanStructures {
  }
 }
 '''
+WGL = '''waveform TEST
+ signal
+ "DATA" : input;
+ "RESULT" : output;
+ "TCK_IN" : input;
+ "SCAN_CLK" : input;
+ "SC_CLK_RX_IN_X" : input;
+ end
+ scanchain
+ c["data"[0], "internal/cell", "RESULT"];
+ end
+ equationsheet test
+ exprset cat
+ Time_period := 10000ps;
+ Time_pulse := 3ns;
+ Time_back := Time_pulse + 5ns;
+ end
+ end
+ timeplate tp period Time_period
+ "DATA" := input[0ps:P, 0ps:S];
+ "RESULT" := output[0ps:X, 2ns:Q];
+ "TCK_IN" := input[0ps:P, 0ps:S];
+ "SCAN_CLK" := input[0ps:D, Time_pulse:S, Time_back:D];
+ "SC_CLK_RX_IN_X" := input[0ps:P, 0ps:S];
+ end
+ scanstate
+ s_in := g c (0
+ 1);
+ s_out := g c (HL);
+ end
+ pattern scan("DATA", "RESULT", "TCK_IN", "SCAN_CLK", "SC_CLK_RX_IN_X")
+ { Pattern 0 Vector 0 TesterCycle 0 }
+ repeat 5 { Vector type: SETUP, TesterCycle: 0 }
+ vector(+,tp) := [0 X 0 0 1];
+ { TesterCycle: 5 }
+ repeat 5 vector(+,tp) := [0 X 1 0 1];
+ loop 2
+ repeat 5 vector(+,tp) := [0 X 0 0 1];
+ repeat 5 vector(+,tp) := [0 X 1 0 1];
+ end
+ { TesterCycle: 30 }
+ scan(+,tp) := [0 X 0 0 1],
+   output[c: s_out],
+   input[c: s_in];
+ { TesterCycle: 32 }
+ vector(+,tp) := [0 X 0 0
+   1];
+ end
+end
+'''
+BODY_WGL = WGL.replace('scan(+,tp) := [0 X 0 0 1]', 'scan(+,tp) := [0 X 0 1 1]')
 
 
 class CheckerTests(unittest.TestCase):
@@ -53,6 +106,152 @@ class CheckerTests(unittest.TestCase):
         else:
             path.write_text(text)
         return checker.check_file(path, self.groups)
+
+    def run_wgl(self, text=WGL, name='sample_setup_v1.wgl.gz'):
+        path = self.root / name
+        if name.endswith('.gz'):
+            path.write_bytes(gzip.compress(text.encode()))
+        else:
+            path.write_text(text)
+        result = checker.check_wgl(path, self.groups, checker.normalize)
+        return result
+
+    def test_wgl_pin_direction_and_clock_symbols(self):
+        result = self.run_wgl()
+        self.assertEqual(result['status'], 'PASS')
+        self.assertEqual([r['role'] for r in result['pins']], ['ScanIn', 'ScanOut'])
+        info = result['_wgl_timing']
+        self.assertEqual((info['cycles'], info['statements'], info['loops']), (33, 6, 1))
+        self.assertEqual(info['tester_cycles_verified'], 4)
+        self.assertEqual(info['clock_names'], ['SCAN_CLK'])  # SC_CLK_RX_IN_X is NRZ data
+        self.assertEqual(info['clock_windows_ps'], {'SCAN_CLK': [3000, 8000]})
+        timing = checker.timing_wgl(result, 'CCD')
+        self.assertEqual(timing['status'], 'PASS', timing['reason'])
+        self.assertEqual(timing['tck']['max_consecutive_periods'], 3)
+        bad = self.run_wgl(WGL.replace('c["data"[0]', 'c["RESULT"'))
+        self.assertEqual(bad['pins'][0]['failure'], 'DIRECTION_MISMATCH')
+
+    def test_wgl_setup_tck_runs_are_checked_to_end_of_file(self):
+        short = self.run_wgl(WGL.replace(' repeat 5 vector(+,tp) := [0 X 1 0 1];\n end',
+                                         ' repeat 4 vector(+,tp) := [0 X 1 0 1];\n end')
+                             .replace(' { TesterCycle: 30 }\n', '').replace(' { TesterCycle: 32 }\n', ''))
+        timing = checker.timing_wgl(short, 'CCD')
+        self.assertEqual(timing['status'], 'PASS', timing['reason'])  # non-5/5 runs are informational
+        self.assertIn('high_run_4_cycles', timing['tck']['violations'])
+        flat = self.run_wgl(WGL.replace('[0 X 1 0 1]', '[0 X 0 0 1]'))
+        timing = checker.timing_wgl(flat, 'CCD')
+        self.assertEqual(timing['status'], 'FAIL')
+        self.assertIn('never toggles', timing['reason'])
+        self.assertEqual(self.run_wgl(WGL)['_wgl_timing']['tck']['toggles'], 6)
+        mismatch = self.run_wgl(WGL.replace('TesterCycle: 30', 'TesterCycle: 31'))
+        self.assertEqual(mismatch['status'], 'ERROR')
+        self.assertIn('TesterCycle', mismatch['error'])
+
+    def test_wgl_body_channellink_and_timing(self):
+        result = self.run_wgl(BODY_WGL, 'sample_body_p1_v1.wgl.gz')
+        self.assertEqual(result['status'], 'PASS')
+        timing = checker.timing_wgl(result, 'CCD')
+        self.assertEqual(timing['status'], 'PASS', timing['reason'])
+        self.assertEqual(timing['scan_clock_one_cycles'], 2)
+        self.assertEqual(timing['scan_clock_max_consecutive_one'], {'SCAN_CLK': 2})
+        single = checker.timing_wgl(self.run_wgl(WGL.replace('[0 X 0 0\n   1]', '[0 X 0 1\n   1]'),
+                                                 'single_body_v1.wgl'), 'CCD')
+        self.assertEqual(single['status'], 'FAIL')
+        self.assertIn('consecutive', single['reason'])
+        plan = checker.channel_link_plan(result, checker.DEFAULT_GROUPS[:2], die='CCD')
+        self.assertEqual(Path(plan['destination']).name, 'sample_body_p1_sc_v1.wgl.gz')
+        self.assertEqual(checker.timing_wgl(self.run_wgl(BODY_WGL.replace('10000ps', '20000ps'),
+                                                         'wrong_body_v1.wgl'), 'CCD')['status'], 'FAIL')
+        no_pulse = checker.timing_wgl(self.run_wgl(WGL, 'idle_body_v1.wgl'), 'CCD')
+        self.assertEqual(no_pulse['status'], 'FAIL')
+        self.assertIn('No scan clock 1', no_pulse['reason'])
+
+    def test_wgl_chain_requires_both_tck_and_scan_clock(self):
+        timing = checker.timing_wgl(self.run_wgl(BODY_WGL, 'x_chain_CP_CCD_G2_v1.wgl.gz'), 'CCD')
+        self.assertEqual(timing['status'], 'PASS', timing['reason'])
+        self.assertEqual(timing['classification'], 'chain(setup+body)')
+        no_clock = checker.timing_wgl(self.run_wgl(WGL, 'x_chain_v1.wgl'), 'CCD')
+        self.assertEqual(no_clock['status'], 'FAIL')
+        self.assertIn('No scan clock 1', no_clock['reason'])
+        no_tck = checker.timing_wgl(self.run_wgl(BODY_WGL.replace('TCK_IN', 'TMS_IN'), 'x_chain_v1.wgl'), 'CCD')
+        self.assertEqual(no_tck['status'], 'UNDETERMINED')
+        bad_tck = BODY_WGL.replace('[0 X 1 0 1]', '[0 X 0 0 1]')
+        self.assertEqual(checker.timing_wgl(self.run_wgl(bad_tck, 'x_chain_v1.wgl'), 'CCD')['status'], 'FAIL')
+
+    def test_wgl_multiline_annotation(self):
+        text = BODY_WGL.replace(' loop 2\n', ' {  Next Cycle Shift-out <X X\n   X X>\n   First Bit <0 0>  }\n loop 2\n')
+        result = self.run_wgl(text, 'x_chain_v1.wgl')
+        self.assertEqual(result['status'], 'PASS', result['error'])
+        self.assertEqual(checker.timing_wgl(result, 'CCD')['status'], 'PASS')
+        self.assertEqual(self.run_wgl(text.split('   X X>')[0], 'x_chain_v1.wgl')['status'], 'ERROR')
+        self.assertEqual(self.run_wgl(text.replace('<0 0>  }', '<0 0> } vector'), 'x_chain_v1.wgl')['status'],
+                         'ERROR')
+
+    def test_wgl_se_cmd_label_marker_only(self):
+        result = self.run_wgl(BODY_WGL.replace(' loop 2\n', 'SE_CMD label:select_x_begin\n loop 2\n'),
+                              'x_chain_v1.wgl')
+        self.assertEqual(result['status'], 'PASS', result['error'])
+        self.assertEqual(result['_wgl_timing']['se_cmd_labels'], 1)
+        self.assertEqual(result['_wgl_timing']['cycles'], 33)
+        bad = self.run_wgl(BODY_WGL.replace(' loop 2\n', 'SE_CMD label:x extra\n loop 2\n'), 'x_chain_v1.wgl')
+        self.assertEqual(bad['status'], 'ERROR')
+
+    def test_wgl_missing_clock_and_unsupported_vector_cannot_pass_timing(self):
+        result = self.run_wgl(WGL.replace('TCK_IN', 'TMS_IN'), 'no_clock_setup_v1.wgl')
+        self.assertEqual(checker.timing_wgl(result, 'CCD')['status'], 'UNDETERMINED')
+        result = self.run_wgl(WGL.replace('[0 X 1 0 1]', '[0 X 1 0]'))
+        self.assertEqual(result['status'], 'ERROR')
+        result = self.run_wgl(WGL.replace(' loop 2\n', ' loop 2\n jump 3;\n'))
+        self.assertEqual(result['status'], 'ERROR')
+        self.assertIn('Unsupported WGL pattern statement', result['error'])
+
+    def test_wgl_truncated_after_chains_or_complete_vector_is_error(self):
+        before_pattern = WGL.split(' pattern scan', 1)[0]
+        result = self.run_wgl(before_pattern)
+        self.assertEqual(result['chains'], 1)
+        self.assertEqual(result['status'], 'ERROR')
+        self.assertIn('Truncated', result['error'])
+        self.assertEqual(checker.timing_wgl(result, 'CCD')['status'], 'ERROR')
+        for text in (WGL.rsplit(' end', 1)[0], WGL.rsplit('end', 1)[0], WGL[:WGL.index('   1];')]):
+            result = self.run_wgl(text)
+            self.assertEqual(result['status'], 'ERROR')
+            self.assertEqual(checker.timing_wgl(result, 'CCD')['status'], 'ERROR')
+
+    def test_cli_wgl_timing_preview_only(self):
+        result = self.run_wgl(BODY_WGL, 'sample_body_v1.wgl.gz')
+        code, report = self.run_cli(result['file'], '--die', 'CCD', '--timing', '--channel-link', '--dry-run')
+        self.assertEqual(code, 0)
+        self.assertEqual(report['timing_summary'], {'PASS': 1})
+        self.assertEqual(report['channel_link_summary'], {'WOULD_COPY': 1})
+        self.assertFalse((self.root / 'v1_Channellink').exists())
+
+    def test_cli_timing_cannot_silently_approve_uncertain_or_failed_clock(self):
+        source = self.run_wgl(WGL.replace('TCK_IN', 'TMS_IN'))
+        code, report = self.run_cli(source['file'], '--die', 'CCD', '--timing')
+        self.assertEqual(code, 2)
+        self.assertEqual(report['timing_summary'], {'UNDETERMINED': 1})
+        body = self.run_wgl(BODY_WGL.replace('10000ps', '20000ps'), 'wrong_body_v1.wgl.gz')
+        code, report = self.run_cli(body['file'], '--die', 'CCD', '--timing', '--channel-link')
+        self.assertEqual(code, 1)
+        self.assertEqual(report['timing_summary'], {'FAIL': 1})
+        self.assertEqual(report['channel_link_summary'], {'SKIPPED': 1})
+        self.assertFalse((self.root / 'v1_Channellink').exists())
+
+    def test_wgl_copy_requires_timing_and_ccd_die(self):
+        source = self.run_wgl(BODY_WGL, 'sample_body_v1.wgl.gz')
+        code, report = self.run_cli(source['file'], '--die', 'CCD', '--channel-link')
+        self.assertEqual(code, 2)
+        self.assertIn('requires --timing', report['error'])
+        code, report = self.run_cli(source['file'], '--die', 'IOD', '--timing')
+        self.assertEqual(code, 2)
+        self.assertEqual(report['timing_summary'], {'UNDETERMINED': 1})
+        self.assertFalse((self.root / 'v1_Channellink').exists())
+
+    def test_stil_frequency_not_proved_by_period_alone(self):
+        source = self.body_result(STIL + "Timing { WaveformTable w { Period '10ns'; } }")
+        timing = checker.timing_stil(source['file'], 'CCD')
+        self.assertEqual(timing['status'], 'UNDETERMINED')
+        self.assertEqual(timing['periods_ps'], [10000])
 
     def test_plain_and_gzip(self):
         for compressed in (False, True):
@@ -203,9 +402,11 @@ class CheckerTests(unittest.TestCase):
         result = self.body_result()
         self.assertTrue(checker.channel_link_plan(result, checker.DEFAULT_GROUPS[:2], die='IOD')['eligible'])
 
-    def test_channel_link_skip_non_body_and_failed_inputs(self):
+    def test_channel_link_skip_non_candidate_and_failed_inputs(self):
         cases = [('sample_setup_v1.stil', STIL),
                  ('sample_body_setup_v1.stil', STIL),
+                 ('sample_chain_setup_v1.stil', STIL),
+                 ('sample_scan_chainlike_v1.stil', STIL),
                  ('sample_body_v1.stil', STIL.replace('"RESULT"', '"MISSING"')),
                  ('empty_body_v1.stil', 'STIL 1.0;'),
                  ('bad_body_v1.stil', STIL + '/*')]
@@ -219,6 +420,76 @@ class CheckerTests(unittest.TestCase):
         result = self.body_result()
         self.assertEqual(checker.export_channel_link(result, checker.DEFAULT_GROUPS[:2], True, die='IOD')['action'], 'WOULD_COPY')
         self.assertFalse((self.root / 'v1_Channellink').exists())
+
+    def test_chain_formats_follow_body_copy_path(self):
+        for suffix in ('.stil', '.stil.gz', '.wgl', '.wgl.gz'):
+            name = 'sample_CHAIN_V2' + suffix
+            result = (self.run_wgl(BODY_WGL, name) if '.wgl' in suffix
+                      else self.body_result(filename=name))
+            source = Path(result['file'])
+            original = source.read_bytes()
+            for die in ('IOD', 'CCD'):
+                with self.subTest(suffix=suffix, die=die):
+                    plan = checker.channel_link_plan(result, checker.DEFAULT_GROUPS[:2], die=die)
+                    destination = self.root / 'v2_Channellink' / ('sample_CHAIN_sc_V2' + suffix)
+                    self.assertEqual(plan['action'], 'ELIGIBLE')
+                    self.assertEqual(Path(plan['destination']), destination)
+                    preview = checker.export_channel_link(result, checker.DEFAULT_GROUPS[:2], True, die=die)
+                    self.assertEqual(preview['action'], 'WOULD_COPY')
+                    self.assertFalse(destination.exists())
+            copied = checker.export_channel_link(result, checker.DEFAULT_GROUPS[:2], die='CCD')
+            self.assertEqual(copied['action'], 'COPIED')
+            self.assertEqual(destination.read_bytes(), original)
+            self.assertEqual(source.read_bytes(), original)
+            self.assertEqual(checker.export_channel_link(result, checker.DEFAULT_GROUPS[:2], die='CCD')['action'],
+                             'ALREADY_EXISTS')
+            self.assertNotIn(destination, checker.find_inputs(self.root))
+
+    def test_chain_requires_directional_groups_in_both_formats(self):
+        for suffix in ('.stil.gz', '.wgl.gz'):
+            for pin in ('AUX', 'MISSING', 'data[0]'):
+                with self.subTest(suffix=suffix, pin=pin):
+                    name = 'sample_chain_v1' + suffix
+                    result = (self.run_wgl(BODY_WGL.replace('"RESULT"', '"' + pin + '"'), name)
+                              if '.wgl' in suffix else
+                              self.body_result(STIL.replace('"RESULT"', '"' + pin + '"'), name))
+                    self.assertEqual(checker.channel_link_plan(result, checker.DEFAULT_GROUPS[:2], die='CCD')['action'],
+                                     'SKIPPED')
+        self.assertFalse((self.root / 'v1_Channellink').exists())
+
+    def test_chain_versions_generated_outputs_and_drd_policy(self):
+        for name, action in (('sample_chain.stil', 'ERROR'),
+                             ('sample_chain_v1_v2.stil', 'ERROR'),
+                             ('sample_chain_sc_v1.stil', 'SKIPPED'),
+                             ('sample_chain_v1_CHL.stil', 'SKIPPED')):
+            result = self.body_result(filename=name)
+            self.assertEqual(checker.channel_link_plan(result, checker.DEFAULT_GROUPS[:2], die='CCD')['action'], action)
+            self.assertEqual(checker.channel_link_plan(result, checker.DEFAULT_GROUPS[:2], die='DRD')['action'],
+                             'NOT_CHECKED')
+
+    def test_cli_chain_check_only_and_wgl_timing_gate(self):
+        stil = self.body_result(filename='sample_chain_v1.stil.gz')
+        wgl = self.run_wgl(BODY_WGL, 'sample_chain_v1.wgl.gz')
+        before = set(self.root.rglob('*'))
+        for result in (stil, wgl):
+            code, report = self.run_cli(result['file'], '--die', 'CCD')
+            self.assertEqual(code, 0)
+            self.assertEqual(report['channel_link_summary'], {'ELIGIBLE': 1})
+            self.assertFalse(report['channel_link_requested'])
+        code, report = self.run_cli(wgl['file'], '--die', 'CCD', '--channel-link')
+        self.assertEqual(code, 2)
+        self.assertIn('requires --timing', report['error'])
+        code, report = self.run_cli(wgl['file'], '--die', 'CCD', '--timing', '--channel-link', '--dry-run')
+        self.assertEqual(code, 0)
+        self.assertEqual(report['channel_link_summary'], {'WOULD_COPY': 1})
+        failed = self.run_wgl(WGL, 'sample_chain_v1.wgl.gz')
+        code, report = self.run_cli(failed['file'], '--die', 'CCD', '--timing', '--channel-link')
+        self.assertEqual(code, 1)
+        self.assertEqual(report['channel_link_summary'], {'SKIPPED': 1})
+        code, report = self.run_cli(stil['file'], '--die', 'CCD', '--timing', '--channel-link')
+        self.assertEqual(code, 2)  # Pin-only fixture cannot prove STIL timing.
+        self.assertEqual(report['channel_link_summary'], {'SKIPPED': 1})
+        self.assertEqual(set(self.root.rglob('*')), before)
 
     def test_channel_link_conflict_never_overwrites(self):
         result = self.body_result()
